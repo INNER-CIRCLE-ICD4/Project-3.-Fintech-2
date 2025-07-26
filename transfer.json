@@ -1,0 +1,6 @@
+{
+  "senderAccountNumber": "EP4FB3CBFF69",
+  "receiverAccountNumber": "EP000000001",
+  "amount": 50000,
+  "memo": "테스트 송금"
+}

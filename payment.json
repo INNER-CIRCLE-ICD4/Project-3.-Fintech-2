@@ -1,0 +1,8 @@
+{
+  "accountNumber": "EP4FB3CBFF69",
+  "amount": 10000,
+  "merchantId": "MERCHANT001",
+  "merchantName": "테스트거래처",
+  "paymentMethod": "BALANCE",
+  "memo": "테스트 결제"
+}

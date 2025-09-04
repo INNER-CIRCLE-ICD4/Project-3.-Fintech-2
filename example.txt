@@ -1,0 +1,294 @@
+package com.example.bank.action;
+
+import java.util.Map;
+
+public class ActionResult {
+    public enum Status { SUCCESS, FAILURE, PENDING }
+
+    private final Status status;
+    private final String code;     // 예: "OK", "INSUFFICIENT_FUNDS", "NETWORK_ERROR"
+    private final String message;  // 사용자/로그 메시지
+    private final Map<String, Object> data;
+
+    public ActionResult(Status status, String code, String message, Map<String, Object> data) {
+        this.status = status;
+        this.code = code;
+        this.message = message;
+        this.data = data;
+    }
+
+    public static ActionResult success(String message, Map<String, Object> data) {
+        return new ActionResult(Status.SUCCESS, "OK", message, data);
+    }
+
+    public static ActionResult failure(String code, String message, Map<String, Object> data) {
+        return new ActionResult(Status.FAILURE, code, message, data);
+    }
+
+    public static ActionResult pending(String message, Map<String, Object> data) {
+        return new ActionResult(Status.PENDING, "PENDING", message, data);
+    }
+
+    public Status getStatus() { return status; }
+    public String getCode() { return code; }
+    public String getMessage() { return message; }
+    public Map<String, Object> getData() { return data; }
+}
+2) 명령 인터페이스 & 구체 명령
+java
+코드 복사
+package com.example.bank.action;
+
+public interface BankAccountActionCommand { }
+java
+코드 복사
+package com.example.bank.action;
+
+import java.util.Objects;
+
+public final class WithdrawTransfer implements BankAccountActionCommand {
+    private final long connectedBankAccountId;
+    private final long amount;
+
+    public WithdrawTransfer(long connectedBankAccountId, long amount) {
+        this.connectedBankAccountId = connectedBankAccountId;
+        this.amount = amount;
+    }
+    public long getConnectedBankAccountId() { return connectedBankAccountId; }
+    public long getAmount() { return amount; }
+
+    @Override public String toString() {
+        return "WithdrawTransfer{id=" + connectedBankAccountId + ", amount=" + amount + '}';
+    }
+    @Override public int hashCode() { return Objects.hash(connectedBankAccountId, amount); }
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof WithdrawTransfer)) return false;
+        WithdrawTransfer that = (WithdrawTransfer) o;
+        return connectedBankAccountId == that.connectedBankAccountId && amount == that.amount;
+    }
+}
+java
+코드 복사
+package com.example.bank.action;
+
+import java.util.Objects;
+
+public final class DepositTransfer implements BankAccountActionCommand {
+    private final long amount;
+    private final String bank;
+    private final String destinationBankAccountNumber;
+
+    public DepositTransfer(long amount, String bank, String destinationBankAccountNumber) {
+        this.amount = amount;
+        this.bank = bank;
+        this.destinationBankAccountNumber = destinationBankAccountNumber;
+    }
+    public long getAmount() { return amount; }
+    public String getBank() { return bank; }
+    public String getDestinationBankAccountNumber() { return destinationBankAccountNumber; }
+
+    @Override public String toString() {
+        return "DepositTransfer{amount=" + amount + ", bank='" + bank +
+               "', dest='" + destinationBankAccountNumber + "'}";
+    }
+    @Override public int hashCode() { return Objects.hash(amount, bank, destinationBankAccountNumber); }
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof DepositTransfer)) return false;
+        DepositTransfer that = (DepositTransfer) o;
+        return amount == that.amount &&
+               Objects.equals(bank, that.bank) &&
+               Objects.equals(destinationBankAccountNumber, that.destinationBankAccountNumber);
+    }
+}
+3) 액션 인터페이스
+java
+코드 복사
+package com.example.bank.action;
+
+public interface BankAccountAction<C extends BankAccountActionCommand> {
+
+    /** 이 액션이 처리할 커맨드 타입(리졸버가 맵핑에 사용) */
+    Class<C> commandType();
+
+    /** 사전 검증(잔액, 한도, 계좌상태 등) */
+    boolean validate(C command);
+
+    /** 보류 저장(거래 생성/아웃박스 기록 등) */
+    void savePending(C command);
+
+    /** 실제 수행(외부 API 호출 or 내부 DB 처리) */
+    ActionResult execute(C command);
+
+    /** 결과 반영(전표/원장 업데이트, 상태전이, 알림 등) */
+    void updateFromResult(C command, ActionResult result);
+}
+4) 리졸버
+java
+코드 복사
+package com.example.bank.action;
+
+import org.springframework.stereotype.Component;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Component
+public class BankAccountActionResolver {
+
+    private final Map<Class<? extends BankAccountActionCommand>,
+                     BankAccountAction<? extends BankAccountActionCommand>> actionMap = new HashMap<>();
+
+    public BankAccountActionResolver(List<BankAccountAction<? extends BankAccountActionCommand>> actions) {
+        for (BankAccountAction<? extends BankAccountActionCommand> action : actions) {
+            actionMap.put(action.commandType(), action);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public <C extends BankAccountActionCommand> BankAccountAction<C> resolve(C command) {
+        BankAccountAction<C> action = (BankAccountAction<C>) actionMap.get(command.getClass());
+        if (action == null) {
+            throw new IllegalArgumentException("No action found for command: " + command.getClass().getName());
+        }
+        return action;
+    }
+}
+5) 프로세서(오케스트레이션)
+java
+코드 복사
+package com.example.bank.action;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class BankAccountActionProcessor {
+
+    private final BankAccountActionResolver resolver;
+
+    public BankAccountActionProcessor(BankAccountActionResolver resolver) {
+        this.resolver = resolver;
+    }
+
+    /**
+     * 전체 흐름: validate -> savePending -> execute -> updateFromResult
+     * 외부호출이 포함되면 Outbox/Event 기반 비동기 처리 권장.
+     */
+    @Transactional
+    public <C extends BankAccountActionCommand> ActionResult process(C command) {
+        BankAccountAction<C> action = resolver.resolve(command);
+
+        if (!action.validate(command)) {
+            throw new IllegalArgumentException("Validation failed: " + command);
+        }
+        action.savePending(command);
+
+        ActionResult result = action.execute(command);
+        action.updateFromResult(command, result);
+
+        return result;
+    }
+}
+6) 구체 액션: 입금/출금
+java
+코드 복사
+package com.example.bank.action;
+
+import org.springframework.stereotype.Component;
+
+import java.util.Collections;
+
+@Component
+public class DepositTransferAction implements BankAccountAction<DepositTransfer> {
+
+    // 예시 의존성 (필요시 주입)
+    // private final ExternalBankClient bankClient;
+    // private final LedgerService ledgerService;
+    // private final TransferRepository transferRepository;
+
+    @Override
+    public Class<DepositTransfer> commandType() {
+        return DepositTransfer.class;
+    }
+
+    @Override
+    public boolean validate(DepositTransfer command) {
+        if (command.getAmount() <= 0) return false;
+        if (command.getBank() == null || command.getBank().isBlank()) return false;
+        if (command.getDestinationBankAccountNumber() == null || command.getDestinationBankAccountNumber().isBlank())
+            return false;
+        // TODO: 한도/제재/부정사용 체크 등
+        return true;
+    }
+
+    @Override
+    public void savePending(DepositTransfer command) {
+        // TODO: 거래 보류 저장, outbox 레코드 persist 등
+        // transferRepository.savePending(command ...);
+    }
+
+    @Override
+    public ActionResult execute(DepositTransfer command) {
+        // TODO: 외부 은행 API 호출 또는 내부 원장에 입금 반영
+        // bankClient.deposit(...);
+        return ActionResult.success("Deposit executed",
+                Collections.singletonMap("amount", command.getAmount()));
+    }
+
+    @Override
+    public void updateFromResult(DepositTransfer command, ActionResult result) {
+        // TODO: 결과에 따라 상태/원장/분개 처리
+        // if (result.getStatus()==SUCCESS) ledgerService.applyDeposit(...);
+        // else ledgerService.markFailed(...);
+    }
+}
+java
+코드 복사
+package com.example.bank.action;
+
+import org.springframework.stereotype.Component;
+
+import java.util.Collections;
+
+@Component
+public class WithdrawTransferAction implements BankAccountAction<WithdrawTransfer> {
+
+    // 예시 의존성
+    // private final BalanceService balanceService;
+    // private final ExternalBankClient bankClient;
+    // private final TransferRepository transferRepository;
+
+    @Override
+    public Class<WithdrawTransfer> commandType() {
+        return WithdrawTransfer.class;
+    }
+
+    @Override
+    public boolean validate(WithdrawTransfer command) {
+        if (command.getAmount() <= 0) return false;
+        // long balance = balanceService.getAvailableBalance(command.getConnectedBankAccountId());
+        // if (balance < command.getAmount()) return false;
+        return true;
+    }
+
+    @Override
+    public void savePending(WithdrawTransfer command) {
+        // TODO: 거래 보류 저장(이중 송금 방지용 business key 포함), outbox 저장
+    }
+
+    @Override
+    public ActionResult execute(WithdrawTransfer command) {
+        // TODO: 출금 API 호출 또는 내부 원장 반영
+        // External 호출 실패 시 FAILURE 반환
+        // try { bankClient.withdraw(...); } catch (IOException e) { ... }
+        return ActionResult.success("Withdrawal executed",
+                Collections.singletonMap("amount", command.getAmount()));
+    }
+
+    @Override
+    public void updateFromResult(WithdrawTransfer command, ActionResult result) {
+        // TODO: 성공 시 차감, 실패 시 롤백/보류해제, 알림 전송 등
+    }
+}

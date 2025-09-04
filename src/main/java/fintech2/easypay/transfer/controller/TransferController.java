@@ -14,16 +14,29 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import fintech2.easypay.account.entity.Account;
+import fintech2.easypay.account.repository.AccountRepository;
 import fintech2.easypay.auth.dto.UserPrincipal;
+import fintech2.easypay.auth.entity.User;
+import fintech2.easypay.auth.repository.UserRepository;
 import fintech2.easypay.auth.service.PinService;
 import fintech2.easypay.common.ApiResponse;
 import fintech2.easypay.common.BusinessException;
 import fintech2.easypay.common.ErrorCode;
+import fintech2.easypay.transfer.action.ActionResult;
+import fintech2.easypay.transfer.action.TransferActionProcessor;
+import fintech2.easypay.transfer.command.InternalTransferCommand;
+import fintech2.easypay.transfer.command.SecureTransferCommand;
 import fintech2.easypay.transfer.dto.RecentTransferResponse;
 import fintech2.easypay.transfer.dto.SecureTransferRequest;
 import fintech2.easypay.transfer.dto.TransferRequest;
 import fintech2.easypay.transfer.dto.TransferResponse;
+import fintech2.easypay.transfer.entity.Transfer;
+import fintech2.easypay.transfer.repository.TransferRepository;
 import fintech2.easypay.transfer.service.TransferService;
+
+import java.util.UUID;
+import org.springframework.context.ApplicationContext;
 
 /**
  * 송금 관리 컴트롤러
@@ -37,7 +50,12 @@ import fintech2.easypay.transfer.service.TransferService;
 public class TransferController {
     
     private final TransferService transferService;
+    private final TransferActionProcessor actionProcessor;
+    private final TransferRepository transferRepository;
+    private final AccountRepository accountRepository;
+    private final UserRepository userRepository;
     private final PinService pinService;
+    private final ApplicationContext applicationContext;
     
     /**
      * 송금 처리 API (기존 - PIN 검증 없음)
@@ -55,7 +73,7 @@ public class TransferController {
     }
 
     /**
-     * 보안 송금 처리 API (PIN 검증 포함)
+     * 보안 송금 처리 API (PIN 검증 포함) - 리팩토링됨
      * PIN 인증이 완료된 후 송금 처리
      * @param userDetails 인증된 사용자 정보
      * @param request PIN 세션 토큰이 포함된 보안 송금 요청
@@ -67,18 +85,90 @@ public class TransferController {
         @AuthenticationPrincipal UserPrincipal userDetails,
         @Valid @RequestBody SecureTransferRequest request) {
         
-        // PIN 세션 토큰 검증
-        if (!pinService.validatePinSessionToken(request.getPinSessionToken(), "transfer")) {
-            throw new BusinessException(ErrorCode.INVALID_PIN_SESSION, "PIN 인증이 유효하지 않습니다.");
-        }
+        // 송금자 조회
+        User sender = userRepository.findByPhoneNumber(userDetails.getUsername())
+                .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_NOT_FOUND));
         
-        // PIN 검증 통과 후 일반 송금 처리
-        TransferResponse response = transferService.transfer(
-            userDetails.getUsername(), 
-            request.toTransferRequest()
+        // 수신자 계좌 조회
+        Account receiverAccount = accountRepository.findByAccountNumber(request.getReceiverAccountNumber())
+                .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_ACCOUNT_NUMBER));
+        
+        User receiver = userRepository.findById(receiverAccount.getUserId())
+                .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_NOT_FOUND));
+        
+        // 송금자 계좌 결정
+        String senderAccountNumber = determineSenderAccount(sender, request.getSenderAccountNumber());
+        
+        // 거래 ID 생성
+        String transactionId = generateTransactionId();
+        
+        // 내부 송금인지 외부 송금인지 판단 (현재는 내부 송금만 지원)
+        boolean isExternal = false; // 향후 확장 시 로직 추가
+        
+        // 보안 송금 커맨드 생성
+        SecureTransferCommand command = new SecureTransferCommand(
+                sender.getId(),
+                receiver.getId(),
+                senderAccountNumber,
+                request.getReceiverAccountNumber(),
+                request.getAmount(),
+                request.getMemo(),
+                transactionId,
+                request.getPinSessionToken(),
+                isExternal,
+                null // 내부 송금이므로 null
         );
         
-        return ApiResponse.success("PIN 인증을 통한 송금이 완료되었습니다.", response);
+        // Action Processor를 통한 보안 송금 처리
+        ActionResult result = actionProcessor.process(command);
+        
+        // 결과에 따른 응답 생성
+        if (result.isSuccess() || result.isPending()) {
+            Transfer transfer = transferRepository.findByTransactionId(transactionId)
+                    .orElseThrow(() -> new BusinessException(ErrorCode.TRANSACTION_NOT_FOUND));
+            
+            TransferResponse response = TransferResponse.from(transfer);
+            return ApiResponse.success("PIN 인증을 통한 송금이 완료되었습니다.", response);
+        } else {
+            throw new BusinessException(ErrorCode.TRANSACTION_FAILED, result.getMessage());
+        }
+    }
+    
+    /**
+     * 송금자 계좌번호 결정 (헬퍼 메서드)
+     */
+    private String determineSenderAccount(User sender, String requestedAccountNumber) {
+        if (requestedAccountNumber != null && !requestedAccountNumber.trim().isEmpty()) {
+            // 특정 계좌 지정된 경우 소유권 확인
+            Account account = accountRepository.findByAccountNumber(requestedAccountNumber)
+                    .orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND));
+            
+            if (!account.getUserId().equals(sender.getId())) {
+                throw new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND, "본인 계좌가 아닙니다.");
+            }
+            
+            return requestedAccountNumber;
+        } else {
+            // 기본 계좌 사용
+            fintech2.easypay.account.service.UserAccountService userAccountService = 
+                applicationContext.getBean(fintech2.easypay.account.service.UserAccountService.class);
+            fintech2.easypay.account.entity.UserAccount primaryUserAccount = userAccountService.getPrimaryAccount(sender.getId())
+                    .orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND, "기본 계좌를 찾을 수 없습니다."));
+            
+            return primaryUserAccount.getAccountNumber();
+        }
+    }
+    
+    /**
+     * 고유한 거래 ID 생성
+     */
+    private String generateTransactionId() {
+        String transactionId;
+        do {
+            transactionId = "TXN" + UUID.randomUUID().toString().replace("-", "").substring(0, 12).toUpperCase();
+        } while (transferRepository.existsByTransactionId(transactionId));
+        
+        return transactionId;
     }
     
     /**

@@ -56,7 +56,7 @@ public class TransferController {
 
     /**
      * 보안 송금 처리 API (PIN 검증 포함)
-     * PIN 인증이 완료된 후 송금 처리
+     * Action Pattern을 사용한 PIN 인증 및 송금 처리
      * @param userDetails 인증된 사용자 정보
      * @param request PIN 세션 토큰이 포함된 보안 송금 요청
      * @return 송금 처리 결과
@@ -67,15 +67,10 @@ public class TransferController {
         @AuthenticationPrincipal UserPrincipal userDetails,
         @Valid @RequestBody SecureTransferRequest request) {
         
-        // PIN 세션 토큰 검증
-        if (!pinService.validatePinSessionToken(request.getPinSessionToken(), "transfer")) {
-            throw new BusinessException(ErrorCode.INVALID_PIN_SESSION, "PIN 인증이 유효하지 않습니다.");
-        }
-        
-        // PIN 검증 통과 후 일반 송금 처리
-        TransferResponse response = transferService.transfer(
+        // Action Pattern을 통한 PIN 검증 및 송금 처리 (PIN 검증은 SecureTransferAction에서 수행)
+        TransferResponse response = transferService.secureTransfer(
             userDetails.getUsername(), 
-            request.toTransferRequest()
+            request
         );
         
         return ApiResponse.success("PIN 인증을 통한 송금이 완료되었습니다.", response);
